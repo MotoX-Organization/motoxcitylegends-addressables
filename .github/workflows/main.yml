@@ -1,0 +1,109 @@
+name: Sync Unity Addressables to fixed release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: latest_pckg
+  RELEASE_TITLE: latest_pckg
+  SOURCE_DIR: ServerData/Android
+
+jobs:
+  sync-release-assets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      - name: Pull Git LFS files
+        run: |
+          git lfs pull
+
+      - name: Validate source directory
+        run: |
+          if [ ! -d "${SOURCE_DIR}" ]; then
+            echo "Source directory '${SOURCE_DIR}' not found."
+            exit 1
+          fi
+
+      - name: Debug uploaded file sizes
+        run: |
+          echo "Listing files under ${SOURCE_DIR}"
+          find "${SOURCE_DIR}" -maxdepth 1 -type f -exec ls -lh {} \;
+
+      - name: Check for LFS pointer files
+        run: |
+          found_pointer=0
+          while IFS= read -r file; do
+            if head -n 1 "$file" | grep -q "version https://git-lfs.github.com/spec/v1"; then
+              echo "LFS pointer detected: $file"
+              found_pointer=1
+            fi
+          done < <(find "${SOURCE_DIR}" -maxdepth 1 -type f)
+
+          if [ "$found_pointer" -eq 1 ]; then
+            echo "Some files are still Git LFS pointer files. Aborting."
+            exit 1
+          fi
+
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${RELEASE_TAG}" >/dev/null 2>&1 || \
+          gh release create "${RELEASE_TAG}" \
+            --title "${RELEASE_TITLE}" \
+            --notes "Auto-synced Unity Addressables release"
+
+      - name: Delete old release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset_ids=$(gh api repos/${{ github.repository }}/releases/tags/${RELEASE_TAG} --jq '.assets[].id')
+
+          if [ -n "$asset_ids" ]; then
+            echo "$asset_ids" | while read -r asset_id; do
+              if [ -n "$asset_id" ]; then
+                echo "Deleting asset id: $asset_id"
+                gh api --method DELETE repos/${{ github.repository }}/releases/assets/$asset_id
+              fi
+            done
+          else
+            echo "No existing assets to delete."
+          fi
+
+      - name: Upload fresh assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=("${SOURCE_DIR}"/*)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No files found in ${SOURCE_DIR}"
+            exit 1
+          fi
+
+          for file in "${files[@]}"; do
+            if [ -f "$file" ]; then
+              echo "Uploading $(basename "$file")"
+              gh release upload "${RELEASE_TAG}" "$file"
+            fi
+          done
+
+      - name: Print asset URLs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/releases/tags/${RELEASE_TAG} \
+            --jq '.assets[] | .browser_download_url'
